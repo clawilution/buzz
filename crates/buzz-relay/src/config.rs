@@ -7,6 +7,29 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tracing::{error, warn};
 
+/// Resolve a bind address for a diagnostic listener. Accepts a full socket
+/// address ("127.0.0.1:8080") or a bare port ("8080", bound on 127.0.0.1).
+/// Defaults to loopback so the listener is never exposed beyond the host.
+fn diagnostic_bind_addr(
+    raw: Option<String>,
+    default_port: u16,
+    var: &str,
+) -> Result<SocketAddr, ConfigError> {
+    let value = match raw {
+        Some(v) if !v.trim().is_empty() => v.trim().to_string(),
+        _ => return Ok(SocketAddr::from(([127, 0, 0, 1], default_port))),
+    };
+    if let Ok(addr) = value.parse::<SocketAddr>() {
+        return Ok(addr);
+    }
+    if let Ok(port) = value.parse::<u16>() {
+        return Ok(SocketAddr::from(([127, 0, 0, 1], port)));
+    }
+    Err(ConfigError::InvalidValue(format!(
+        "{var} must be a socket address (e.g. 127.0.0.1:{default_port}) or a port number"
+    )))
+}
+
 /// Default maximum inbound WebSocket frame size in bytes.
 ///
 /// Must comfortably exceed accepted event content sizes after Nostr JSON and
@@ -191,11 +214,13 @@ pub struct Config {
     /// Optional Unix Domain Socket path. When set, the relay also listens on this
     /// UDS for traffic (e.g. service mesh sidecar). Health probes still use TCP.
     pub uds_path: Option<String>,
-    /// TCP port for the health-only router (`/_liveness`, `/_readiness`, `/_status`).
-    /// Separate from the app router so K8s probes bypass Istio and auth middleware.
-    pub health_port: u16,
-    /// TCP port for the Prometheus metrics exporter (`GET /metrics`).
-    pub metrics_port: u16,
+    /// Address the health-only router (`/_liveness`, `/_readiness`, `/_status`)
+    /// binds. Separate from the app router so K8s probes bypass Istio and auth
+    /// middleware. Defaults to loopback so it is never exposed beyond the host.
+    pub health_addr: SocketAddr,
+    /// Address the Prometheus metrics exporter (`GET /metrics`) binds. Defaults
+    /// to loopback so it is never exposed beyond the host.
+    pub metrics_addr: SocketAddr,
 
     /// When true, NIP-42 pubkey-only authentication (no API token) is
     /// restricted to pubkeys in the `pubkey_allowlist` table. Users with valid
@@ -905,15 +930,26 @@ impl Config {
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty());
 
-        let health_port = std::env::var("BUZZ_HEALTH_PORT")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(8080);
+        // Diagnostic listeners default to loopback: they are host-local
+        // health/metrics surfaces and must not be network-reachable by
+        // default. BUZZ_HEALTH_ADDR / BUZZ_METRICS_ADDR take a full socket
+        // address; bare port values (incl. via the legacy BUZZ_*_PORT vars)
+        // bind on 127.0.0.1 for back-compat.
+        let health_addr = diagnostic_bind_addr(
+            std::env::var("BUZZ_HEALTH_ADDR")
+                .ok()
+                .or_else(|| std::env::var("BUZZ_HEALTH_PORT").ok()),
+            8080,
+            "BUZZ_HEALTH_ADDR",
+        )?;
 
-        let metrics_port = std::env::var("BUZZ_METRICS_PORT")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(9102);
+        let metrics_addr = diagnostic_bind_addr(
+            std::env::var("BUZZ_METRICS_ADDR")
+                .ok()
+                .or_else(|| std::env::var("BUZZ_METRICS_PORT").ok()),
+            9102,
+            "BUZZ_METRICS_ADDR",
+        )?;
 
         let s3_addressing_style = match std::env::var("BUZZ_S3_ADDRESSING_STYLE") {
             Ok(value) => value.parse().map_err(ConfigError::InvalidValue)?,
@@ -1348,8 +1384,8 @@ impl Config {
             cors_origins,
             relay_private_key,
             uds_path,
-            health_port,
-            metrics_port,
+            health_addr,
+            metrics_addr,
             pubkey_allowlist_enabled,
             require_relay_membership,
             huddle_audio_available,
