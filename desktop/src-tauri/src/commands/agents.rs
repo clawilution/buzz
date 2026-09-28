@@ -1043,6 +1043,10 @@ pub async fn stop_managed_agent(
     use tauri::Manager;
     tokio::task::spawn_blocking(move || {
         let state = app.state::<AppState>();
+        let _transition = state
+            .managed_agent_runtime_transition
+            .lock()
+            .map_err(|error| error.to_string())?;
         let _store_guard = state
             .managed_agents_store_lock
             .lock()

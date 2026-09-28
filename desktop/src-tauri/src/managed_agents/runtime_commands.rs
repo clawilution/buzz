@@ -1,4 +1,5 @@
 use std::sync::atomic::Ordering;
+use std::time::{Duration, Instant};
 
 use tauri::{AppHandle, Emitter, Manager};
 
@@ -9,11 +10,18 @@ use super::{
     spawn_agent_child, terminate_process, terminate_untracked_pair_runtime,
     write_agent_runtime_receipt, AgentReadiness, BackendKind, ManagedAgentPairRuntime,
     ManagedAgentRuntimeKey, ManagedAgentRuntimeLifecycle, ManagedAgentRuntimeReceipt,
-    ManagedAgentRuntimeStatus,
+    ManagedAgentRuntimeStatus, RuntimeRecovery,
 };
 use crate::app_state::AppState;
 
 const STATUS_EVENT: &str = "managed-agent-runtime-status";
+const RECOVERY_POLL: Duration = Duration::from_secs(10);
+const HEALTHY_RUN: Duration = Duration::from_secs(300);
+const RECOVERY_DELAYS: [Duration; 3] = [
+    Duration::from_secs(5),
+    Duration::from_secs(15),
+    Duration::from_secs(45),
+];
 
 fn status_for(
     app: &AppHandle,
@@ -75,6 +83,222 @@ fn status_for_with(
 
 fn emit_status(app: &AppHandle, status: &ManagedAgentRuntimeStatus) {
     let _ = app.emit(STATUS_EVENT, status);
+}
+
+/// Polls independently of the Agents screen. A clean exit is still unexpected
+/// while the pair remains tracked; explicit stop removes it before this poll.
+pub(crate) fn spawn_runtime_supervisor(app: AppHandle) {
+    tauri::async_runtime::spawn(async move {
+        loop {
+            tokio::time::sleep(RECOVERY_POLL).await;
+            if app
+                .state::<AppState>()
+                .shutdown_started
+                .load(Ordering::Acquire)
+            {
+                break;
+            }
+            let tick_app = app.clone();
+            match tokio::task::spawn_blocking(move || supervise_runtime_tick(&tick_app)).await {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => eprintln!("buzz-desktop: runtime recovery: {error}"),
+                Err(error) => eprintln!("buzz-desktop: runtime recovery task failed: {error}"),
+            }
+        }
+    });
+}
+
+fn recovery_failure(recovery: &mut RuntimeRecovery, now: Instant) -> Option<Duration> {
+    if recovery
+        .started_at
+        .is_some_and(|start| now.duration_since(start) >= HEALTHY_RUN)
+    {
+        recovery.failures = 0;
+    }
+    recovery.started_at = None;
+    recovery.failures = recovery.failures.saturating_add(1);
+    let delay = RECOVERY_DELAYS
+        .get(usize::from(recovery.failures - 1))
+        .copied();
+    recovery.next_retry = delay.map(|delay| now + delay);
+    recovery.exhausted = delay.is_none();
+    delay
+}
+
+fn poll_child_exit(child: &mut std::process::Child) -> Option<(String, Option<i32>)> {
+    match child.try_wait() {
+        Ok(Some(status)) => Some((
+            format!("harness exited with status {status}"),
+            status.code(),
+        )),
+        Err(error) => Some((format!("failed to inspect harness: {error}"), None)),
+        Ok(None) => None,
+    }
+}
+
+fn due_recovery_keys(
+    recovery: &std::collections::HashMap<ManagedAgentRuntimeKey, RuntimeRecovery>,
+    is_running: impl Fn(&ManagedAgentRuntimeKey) -> bool,
+    now: Instant,
+) -> Vec<(ManagedAgentRuntimeKey, u8)> {
+    recovery
+        .iter()
+        .filter(|(key, entry)| {
+            !entry.exhausted
+                && entry.next_retry.is_some_and(|deadline| deadline <= now)
+                && !is_running(key)
+        })
+        .map(|(key, entry)| (key.clone(), entry.failures))
+        .collect()
+}
+
+fn supervise_runtime_tick(app: &AppHandle) -> Result<(), String> {
+    let state = app.state::<AppState>();
+    let _transition = state
+        .managed_agent_runtime_transition
+        .lock()
+        .map_err(|e| e.to_string())?;
+    if state.shutdown_started.load(Ordering::Acquire) {
+        return Ok(());
+    }
+    let _store = state
+        .managed_agents_store_lock
+        .lock()
+        .map_err(|e| e.to_string())?;
+    let mut records = load_managed_agents(app)?;
+    let mut runtimes = state
+        .managed_agent_processes
+        .lock()
+        .map_err(|e| e.to_string())?;
+    let mut recovery = state
+        .managed_agent_recovery
+        .lock()
+        .map_err(|e| e.to_string())?;
+    recovery.retain(|key, _| {
+        records.iter().any(|record| {
+            record.pubkey.eq_ignore_ascii_case(&key.pubkey) && record.backend == BackendKind::Local
+        })
+    });
+    let now = Instant::now();
+    let mut changed = false;
+    let mut exited = Vec::new();
+    for (key, runtime) in runtimes.iter_mut() {
+        if let Some((reason, code)) = poll_child_exit(&mut runtime.child) {
+            exited.push((key.clone(), reason, code));
+        } else if recovery.get(key).is_some_and(|entry| {
+            entry
+                .started_at
+                .is_some_and(|start| now.duration_since(start) >= HEALTHY_RUN)
+        }) {
+            recovery.remove(key);
+        }
+    }
+    for (key, exit_error, exit_code) in exited {
+        let Some(runtime) = runtimes.remove(&key) else {
+            continue;
+        };
+        super::remove_agent_runtime_receipt(app, &key);
+        state.clear_agent_session_cache(&key);
+        let entry = recovery
+            .entry(key.clone())
+            .or_insert_with(RuntimeRecovery::new);
+        let delay = recovery_failure(entry, now);
+        let detail = super::meaningful_agent_error_from_log(&runtime.log_path)
+            .map(|error| error.message)
+            .unwrap_or(exit_error);
+        let error = match delay {
+            Some(delay) => format!("{detail}; restarting in {}s (attempt {}/3)", delay.as_secs(), entry.failures),
+            None => format!("{detail}; automatic recovery exhausted after {} exits. Start the agent manually to retry.", entry.failures),
+        };
+        if let Some(record) = records
+            .iter_mut()
+            .find(|record| record.pubkey.eq_ignore_ascii_case(&key.pubkey))
+        {
+            record.updated_at = crate::util::now_iso();
+            record.last_stopped_at = Some(record.updated_at.clone());
+            record.last_exit_code = exit_code;
+            record.last_error = Some(error.clone());
+            record.last_error_code = None;
+            let mut status = status_for(app, record, &key, None, None);
+            status.lifecycle = ManagedAgentRuntimeLifecycle::Failed;
+            status.error = Some(error);
+            emit_status(app, &status);
+            changed = true;
+        }
+    }
+    let due = due_recovery_keys(&recovery, |key| runtimes.contains_key(key), now);
+    if changed {
+        save_managed_agents(app, &records)?;
+    }
+    drop(recovery);
+    drop(runtimes);
+    drop(_store);
+    drop(_transition);
+
+    for (key, generation) in due {
+        match start_pair(
+            key.pubkey.clone(),
+            key.relay_url.clone(),
+            true,
+            None,
+            Some(generation),
+            app.clone(),
+        ) {
+            Ok(_) => {
+                if let Ok(mut recovery) = state.managed_agent_recovery.lock() {
+                    if let Some(entry) = recovery.get_mut(&key) {
+                        if entry.failures == generation {
+                            entry.started_at = Some(Instant::now());
+                            entry.next_retry = None;
+                        }
+                    }
+                }
+            }
+            Err(error) => {
+                let mut recovery = state
+                    .managed_agent_recovery
+                    .lock()
+                    .map_err(|e| e.to_string())?;
+                let Some(entry) = recovery.get_mut(&key) else {
+                    continue;
+                };
+                if entry.failures != generation {
+                    continue;
+                }
+                let delay = recovery_failure(entry, Instant::now());
+                let message = match delay {
+                    Some(delay) => format!("restart failed: {error}; retrying in {}s", delay.as_secs()),
+                    None => format!("restart failed: {error}; automatic recovery exhausted. Start the agent manually to retry."),
+                };
+                drop(recovery);
+                // The failed state must remain visible even after the dead pair
+                // has been removed from the runtime map.
+                let _store = state
+                    .managed_agents_store_lock
+                    .lock()
+                    .map_err(|e| e.to_string())?;
+                let mut records = load_managed_agents(app)?;
+                let failed_status = if let Some(record) = records
+                    .iter_mut()
+                    .find(|record| record.pubkey.eq_ignore_ascii_case(&key.pubkey))
+                {
+                    record.updated_at = crate::util::now_iso();
+                    record.last_error = Some(message.clone());
+                    let mut status = status_for(app, record, &key, None, None);
+                    status.lifecycle = ManagedAgentRuntimeLifecycle::Failed;
+                    status.error = Some(message);
+                    Some(status)
+                } else {
+                    None
+                };
+                if let Some(status) = failed_status {
+                    save_managed_agents(app, &records)?;
+                    emit_status(app, &status);
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 fn observer_lifecycle_key(
@@ -157,50 +381,17 @@ pub async fn list_managed_agent_runtimes(
             .managed_agents_store_lock
             .lock()
             .map_err(|e| e.to_string())?;
-        let mut records = load_managed_agents(&app)?;
+        let records = load_managed_agents(&app)?;
         let mut runtimes = state
             .managed_agent_processes
             .lock()
             .map_err(|e| e.to_string())?;
-        let exited_keys: Vec<_> = runtimes
-            .iter_mut()
-            .filter_map(|(key, runtime)| match runtime.child.try_wait() {
-                Ok(Some(_)) | Err(_) => Some(key.clone()),
-                Ok(None) => None,
-            })
-            .collect();
-        let records_changed = !exited_keys.is_empty();
         let mut statuses = Vec::new();
-        for key in exited_keys {
-            runtimes.remove(&key);
-            super::remove_agent_runtime_receipt(&app, &key);
-            state.clear_agent_session_cache(&key);
-            if let Some(record) = records
-                .iter_mut()
-                .find(|record| record.pubkey.eq_ignore_ascii_case(&key.pubkey))
-            {
-                record.updated_at = crate::util::now_iso();
-                record.last_stopped_at = Some(record.updated_at.clone());
-                let status = status_for_with(
-                    &app,
-                    record,
-                    &key,
-                    None,
-                    None,
-                    StatusInputs {
-                        personas: &personas,
-                        global: &global,
-                    },
-                );
-                emit_status(&app, &status);
-                statuses.push(status);
-            }
-        }
-        statuses.extend(runtimes.iter().filter_map(|(key, runtime)| {
+        statuses.extend(runtimes.iter_mut().filter_map(|(key, runtime)| {
             let record = records
                 .iter()
                 .find(|record| record.pubkey.eq_ignore_ascii_case(&key.pubkey))?;
-            Some(status_for_with(
+            let mut status = status_for_with(
                 &app,
                 record,
                 key,
@@ -210,14 +401,41 @@ pub async fn list_managed_agent_runtimes(
                     personas: &personas,
                     global: &global,
                 },
-            ))
+            );
+            if runtime.child.try_wait().ok().flatten().is_some() {
+                status.lifecycle = ManagedAgentRuntimeLifecycle::Failed;
+                status.error = Some("Agent process exited; recovery is pending".into());
+                status.pid = None;
+            }
+            Some(status)
+        }));
+        let recovery = state
+            .managed_agent_recovery
+            .lock()
+            .map_err(|e| e.to_string())?;
+        statuses.extend(recovery.iter().filter_map(|(key, _)| {
+            if runtimes.contains_key(key) {
+                return None;
+            }
+            let record = records
+                .iter()
+                .find(|record| record.pubkey.eq_ignore_ascii_case(&key.pubkey))?;
+            let mut status = status_for_with(
+                &app,
+                record,
+                key,
+                None,
+                None,
+                StatusInputs {
+                    personas: &personas,
+                    global: &global,
+                },
+            );
+            status.lifecycle = ManagedAgentRuntimeLifecycle::Failed;
+            status.error = record.last_error.clone();
+            Some(status)
         }));
         drop(runtimes);
-        // Records are only mutated above when a runtime exited — skip the store
-        // rewrite on the common nothing-changed poll.
-        if records_changed {
-            save_managed_agents(&app, &records)?;
-        }
         Ok(statuses)
     })
     .await
@@ -229,7 +447,16 @@ pub(crate) fn start_managed_agent_runtime_pair_lazy(
     relay_url: String,
     app: AppHandle,
 ) -> Result<ManagedAgentRuntimeStatus, String> {
-    start_pair(pubkey, relay_url, true, None, app)
+    let status = start_pair(pubkey, relay_url, true, None, None, app.clone())?;
+    app.state::<AppState>()
+        .managed_agent_recovery
+        .lock()
+        .map_err(|e| e.to_string())?
+        .remove(&ManagedAgentRuntimeKey::new(
+            status.pubkey.clone(),
+            &status.relay_url,
+        )?);
+    Ok(status)
 }
 
 #[tauri::command]
@@ -246,6 +473,7 @@ fn start_pair(
     relay_url: String,
     lazy: bool,
     expected_updated_at: Option<&str>,
+    recovery_generation: Option<u8>,
     app: AppHandle,
 ) -> Result<ManagedAgentRuntimeStatus, String> {
     let state = app.state::<AppState>();
@@ -255,6 +483,19 @@ fn start_pair(
         .map_err(|e| e.to_string())?;
     if state.shutdown_started.load(Ordering::Acquire) {
         return Err("desktop shutdown has started".into());
+    }
+    let key = ManagedAgentRuntimeKey::new(pubkey.clone(), &relay_url)?;
+    if let Some(generation) = recovery_generation {
+        let recovery = state
+            .managed_agent_recovery
+            .lock()
+            .map_err(|e| e.to_string())?;
+        if !recovery
+            .get(&key)
+            .is_some_and(|entry| entry.failures == generation && !entry.exhausted)
+        {
+            return Err("automatic restart was cancelled".into());
+        }
     }
     let _store = state
         .managed_agents_store_lock
@@ -268,7 +509,6 @@ fn start_pair(
     if expected_updated_at.is_some_and(|expected| record.updated_at != expected) {
         return Err("managed agent changed while runtime reconciliation was in flight".into());
     }
-    let key = ManagedAgentRuntimeKey::new(pubkey, &relay_url)?;
     let mut runtimes = state
         .managed_agent_processes
         .lock()
@@ -332,6 +572,11 @@ pub fn stop_managed_agent_runtime(
     let mut records = load_managed_agents(&app)?;
     let record = find_managed_agent_mut(&mut records, &pubkey)?;
     let key = ManagedAgentRuntimeKey::new(pubkey, &relay_url)?;
+    state
+        .managed_agent_recovery
+        .lock()
+        .map_err(|e| e.to_string())?
+        .remove(&key);
     let mut runtimes = state
         .managed_agent_processes
         .lock()
@@ -374,6 +619,8 @@ pub fn stop_managed_agent_runtime(
     record.runtime_pid = None;
     record.updated_at = crate::util::now_iso();
     record.last_stopped_at = Some(record.updated_at.clone());
+    record.last_error = None;
+    record.last_error_code = None;
     let status = status_for(&app, record, &key, None, None);
     drop(runtimes);
     save_managed_agents(&app, &records)?;
@@ -388,7 +635,7 @@ pub fn restart_managed_agent_runtime(
     app: AppHandle,
 ) -> Result<ManagedAgentRuntimeStatus, String> {
     stop_managed_agent_runtime(pubkey.clone(), relay_url.clone(), app.clone())?;
-    start_pair(pubkey, relay_url, true, None, app)
+    start_pair(pubkey, relay_url, true, None, None, app)
 }
 
 /// Probe whether this agent can operate on `requested_relay_url`.
@@ -512,6 +759,7 @@ pub async fn reconcile_managed_agent_runtimes(
                         key.relay_url.clone(),
                         true,
                         Some(&record.updated_at),
+                        None,
                         app.clone(),
                     ) {
                         Ok(mut status) => {
@@ -576,6 +824,64 @@ pub async fn reconcile_managed_agent_runtimes(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[cfg(unix)]
+    fn clean_child_exit_consumes_recovery_budget() {
+        // A code-0 ACP exit still strands a live assignment. Exercise the
+        // same child poll and crash budget used by the background watchdog.
+        let mut child = std::process::Command::new("/usr/bin/true").spawn().unwrap();
+        let (reason, code) = loop {
+            if let Some(exit) = poll_child_exit(&mut child) {
+                break exit;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        assert_eq!(code, Some(0));
+        assert!(reason.contains("exited"));
+        let now = Instant::now();
+        let mut recovery = RuntimeRecovery::new();
+        assert_eq!(
+            recovery_failure(&mut recovery, now),
+            Some(Duration::from_secs(5))
+        );
+        assert_eq!(
+            recovery_failure(&mut recovery, now),
+            Some(Duration::from_secs(15))
+        );
+        assert_eq!(
+            recovery_failure(&mut recovery, now),
+            Some(Duration::from_secs(45))
+        );
+        assert_eq!(recovery_failure(&mut recovery, now), None);
+        assert!(recovery.exhausted);
+    }
+
+    #[test]
+    fn healthy_run_resets_crash_budget() {
+        let now = Instant::now();
+        let mut recovery = RuntimeRecovery::new();
+        recovery.failures = 3;
+        recovery.started_at = Some(now - HEALTHY_RUN);
+        assert_eq!(
+            recovery_failure(&mut recovery, now),
+            Some(Duration::from_secs(5))
+        );
+        assert_eq!(recovery.failures, 1);
+    }
+
+    #[test]
+    fn intentional_stop_cancels_pending_restart() {
+        let key = ManagedAgentRuntimeKey::new("aa".repeat(32), "wss://relay.example").unwrap();
+        let now = Instant::now();
+        let mut recovery = std::collections::HashMap::new();
+        let mut attempt = RuntimeRecovery::new();
+        recovery_failure(&mut attempt, now - Duration::from_secs(5));
+        recovery.insert(key.clone(), attempt);
+        assert_eq!(due_recovery_keys(&recovery, |_| false, now).len(), 1);
+        recovery.remove(&key); // same cancellation performed by the stop path
+        assert!(due_recovery_keys(&recovery, |_| false, now).is_empty());
+    }
 
     #[test]
     fn list_managed_agent_runtimes_returns_a_future() {
