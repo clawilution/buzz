@@ -127,6 +127,13 @@ pub fn stop_managed_agent_workspace_pair(
 ) -> Result<(), String> {
     use tauri::Manager;
     let state = app.state::<crate::app_state::AppState>();
+    if let Some(key) = super::workspace_pair_key(app, record) {
+        state
+            .managed_agent_recovery
+            .lock()
+            .map_err(|e| e.to_string())?
+            .remove(&key);
+    }
     match super::workspace_pair_key(app, record) {
         Some(pair_key) if runtimes.contains_key(&pair_key) => {
             stop_managed_agent_pair(app, record, runtimes, &pair_key)?;
@@ -144,6 +151,8 @@ pub fn stop_managed_agent_workspace_pair(
             // live pairs in other communities, so stay pair-scoped.
             stop_legacy_scalar_pid(app, record)?;
             state.clear_agent_session_cache(&pair_key);
+            record.last_error = None;
+            record.last_error_code = None;
         }
         None => {
             stop_legacy_scalar_pid(app, record)?;

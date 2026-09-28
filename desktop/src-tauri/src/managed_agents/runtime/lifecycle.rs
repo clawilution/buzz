@@ -108,9 +108,9 @@ pub fn sync_managed_agent_processes(
     }
 
     let exited_pubkeys: Vec<String> = exited.iter().map(|key| key.pubkey.clone()).collect();
-    for key in exited {
-        runtimes.remove(&key);
-    }
+    // Keep exited pairs tracked until the background supervisor observes them.
+    // Other commands also call this sync function; removing a child here would
+    // erase the only evidence the supervisor can use to restart it.
 
     // `runtime_pid` is legacy bookkeeping. Pair runtimes and receipts are the
     // authoritative lifecycle source; migration cleanup is handled separately.

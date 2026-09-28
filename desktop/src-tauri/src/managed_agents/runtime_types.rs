@@ -2,6 +2,28 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
 use super::ManagedAgentProcess;
+use std::time::Instant;
+
+/// Desktop-local crash budget for a running pair. Explicit stops remove this
+/// entry; a healthy five-minute run resets the budget.
+#[derive(Debug)]
+pub(crate) struct RuntimeRecovery {
+    pub failures: u8,
+    pub next_retry: Option<Instant>,
+    pub started_at: Option<Instant>,
+    pub exhausted: bool,
+}
+
+impl RuntimeRecovery {
+    pub fn new() -> Self {
+        Self {
+            failures: 0,
+            next_retry: None,
+            started_at: None,
+            exhausted: false,
+        }
+    }
+}
 
 /// Canonical identity of one managed-agent harness on one relay.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]

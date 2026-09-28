@@ -964,7 +964,15 @@ pub fn start_managed_agent_process(
     record.last_error = None;
     record.last_error_code = None;
 
-    runtimes.insert(key, ManagedAgentPairRuntime::starting(process));
+    runtimes.insert(key.clone(), ManagedAgentPairRuntime::starting(process));
+    // A user-initiated start supersedes an exhausted automatic recovery.
+    if let Ok(mut recovery) = app
+        .state::<crate::app_state::AppState>()
+        .managed_agent_recovery
+        .lock()
+    {
+        recovery.remove(&key);
+    }
     Ok(())
 }
 

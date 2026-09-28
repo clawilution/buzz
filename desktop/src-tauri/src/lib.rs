@@ -457,6 +457,13 @@ pub fn run() {
                     .store(true, Ordering::Release);
             }
 
+            // Detect harness exits even when no Agents UI is open. The
+            // supervisor distinguishes an unexpected exit from an explicit
+            // stop by checking the tracked pair under the transition lock.
+            if !recovery_mode {
+                managed_agents::spawn_runtime_supervisor(app_handle.clone());
+            }
+
             // Periodic sweep: reap orphaned agents from dead instances every 60s.
             // Catches agents that escaped both the Justfile trap and boot-time
             // reaping (e.g. a `just staging` Ctrl+C leak that only gets collected
