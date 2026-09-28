@@ -108,6 +108,8 @@ mod lifecycle;
 #[cfg(test)]
 use lifecycle::kill_stale_tracked_processes_with;
 pub use lifecycle::{kill_stale_tracked_processes, sync_managed_agent_processes};
+mod agent_child_env;
+pub(in crate::managed_agents) use agent_child_env::fence_appimage_env;
 mod spawn_key; // production spawn-key derivation + its regressions
 pub(crate) use spawn_key::bound_runtime_key;
 
@@ -835,6 +837,15 @@ pub fn spawn_agent_child(
             session_policy: acp_session_policy,
         },
     );
+
+    // AppImage env fence: strip the AppImage's bundled-lib env (APPDIR,
+    // LD_LIBRARY_PATH, GTK_PATH, GIO_EXTRA_MODULES, mount-prefixed
+    // XDG_DATA_DIRS) so agent children — and their sandboxed tool children
+    // (Codex seccomp wrappers running headless Chromium) — resolve host
+    // libraries instead of the read-only squashfs mount. Must run AFTER all
+    // env layers above (an explicit env() write wins) and BEFORE the spawn.
+    // See `agent_child_env` module docs for the crash mechanism this closes.
+    crate::managed_agents::runtime::fence_appimage_env(&mut command);
 
     // Spawn in its own process group (Unix) or with CREATE_NO_WINDOW (Windows).
     #[cfg(unix)]
